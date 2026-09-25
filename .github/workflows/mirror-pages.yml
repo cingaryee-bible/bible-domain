@@ -1,0 +1,128 @@
+name: Sync daily readings to bible.cingaryee.com
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Read the list of public website files
+        uses: actions/checkout@v6
+        with:
+          repository: cingaryee-bible/everyday
+          ref: main
+          path: upstream
+          sparse-checkout: public
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Copy the published website without redirecting visitors
+        id: mirror
+        env:
+          MIRROR_NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readdir, readFile, mkdir, writeFile } from 'node:fs/promises';
+          import { join, dirname } from 'node:path';
+          import { createHash } from 'node:crypto';
+          
+          async function mirrorSite({ publicDir, outputDir, sourceBase, nonce, fetcher = fetch }) {
+            async function list(dir, prefix = '') {
+              const paths = [];
+              for (const entry of await readdir(dir, { withFileTypes: true })) {
+                const relative = prefix + entry.name;
+                if (entry.isDirectory()) paths.push(...await list(join(dir, entry.name), relative + '/'));
+                else if (entry.isFile() && entry.name !== 'CNAME') paths.push(relative);
+              }
+              return paths.sort();
+            }
+            const files = await list(publicDir);
+            for (const required of ['index.html', 'daily-content.js', 'manifest.webmanifest']) {
+              if (!files.includes(required)) throw new Error(`Missing source file: ${required}`);
+            }
+            async function download(relative, verification = false) {
+              const url = new URL(relative, sourceBase);
+              url.searchParams.set('mirror', nonce + (verification ? '-verify' : ''));
+              const response = await fetcher(url, { redirect: 'error', signal: AbortSignal.timeout(30000) });
+              if (!response.ok) throw new Error(`Source ${relative}: HTTP ${response.status}`);
+              if (response.url) {
+                const actual = new URL(response.url);
+                if (actual.origin !== url.origin || actual.pathname !== url.pathname) throw new Error('Source URL changed');
+              }
+              return Buffer.from(await response.arrayBuffer());
+            }
+            const content = new Map();
+            for (let offset = 0; offset < files.length; offset += 4) {
+              await Promise.all(files.slice(offset, offset + 4).map(async path => content.set(path, await download(path))));
+            }
+            for (const path of ['index.html', 'daily-content.js']) {
+              if (!content.get(path).equals(await download(path, true))) throw new Error('Source changed during copy; keep previous publication');
+            }
+            const manifest = JSON.parse(content.get('manifest.webmanifest').toString());
+            if (manifest.display !== 'standalone' || manifest.start_url !== './' || manifest.scope !== './') {
+              throw new Error('Home Screen installation must remain on its own origin');
+            }
+            const hash = createHash('sha256');
+            for (const path of files) {
+              const body = content.get(path);
+              hash.update(path + '\0').update(body);
+              await mkdir(dirname(join(outputDir, path)), { recursive: true });
+              await writeFile(join(outputDir, path), body);
+            }
+            await writeFile(join(outputDir, '.nojekyll'), '');
+            const status = { fingerprint: hash.digest('hex'), source: sourceBase, files: files.length, copiedAt: new Date().toISOString() };
+            await writeFile(join(outputDir, 'mirror-status.json'), JSON.stringify(status, null, 2) + '\n');
+            return status;
+          }
+          
+          import { appendFile } from 'node:fs/promises';
+          const status = await mirrorSite({
+            publicDir: 'upstream/public',
+            outputDir: 'site',
+            sourceBase: 'https://cingaryee-bible.github.io/everyday/',
+            nonce: process.env.MIRROR_NONCE
+          });
+          let previous;
+          try {
+            const response = await fetch('https://bible.cingaryee.com/mirror-status.json?check=' + process.env.MIRROR_NONCE, { redirect: 'error', signal: AbortSignal.timeout(15000) });
+            if (response.ok) previous = await response.json();
+          } catch {}
+          const changed = previous?.fingerprint !== status.fingerprint;
+          await appendFile(process.env.GITHUB_OUTPUT, 'changed=' + changed + '\n');
+          console.log(changed ? 'Copied ' + status.files + ' published files; ready to deploy.' : 'Published content is already synchronized.');
+          NODE
+
+      - name: Configure Pages
+        if: steps.mirror.outputs.changed == 'true'
+        uses: actions/configure-pages@v5
+
+      - name: Upload synchronized website
+        if: steps.mirror.outputs.changed == 'true'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+      - name: Publish custom domain
+        if: steps.mirror.outputs.changed == 'true'
+        id: deployment
+        uses: actions/deploy-pages@v4
